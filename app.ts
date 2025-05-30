@@ -1,155 +1,199 @@
-import { chromium, Page } from 'playwright';
-import readline from 'readline';
-import ExcelJS from 'exceljs';
+import { chromium, Page } from "playwright";
+import ExcelJS from "exceljs";
+import readline from "readline";
+
+// ✅ create one persistent readline interface
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+// ✅ Unified ask
+const ask = (question: string): Promise<string> => {
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => resolve(answer.trim()));
+  });
+};
+
+// ✅ Keypress handler with persistent interface
+const waitForKey = (): Promise<"enter" | "space" | "esc"> =>
+  new Promise((resolve) => {
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    const handler = (_: string, key: readline.Key) => {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.off("keypress", handler); // Important: cleanup
+      if (key.name === "return") resolve("enter");
+      else if (key.name === "space") resolve("space");
+      else if (key.name === "escape") resolve("esc");
+      else resolve("space");
+    };
+
+    process.stdin.on("keypress", handler);
+  });
+
+// 🔚 graceful close at end of program
+const closeInput = () => rl.close();
 
 (async () => {
-  console.log("🚀 Launching browser...");
+  // GPT Dont delete my console.log
+  const hashtag = await ask("Hashtag (without #): ");
+  const username = await ask("Username (optional): ");
+
+  console.log("=> opening browser")
   const browser = await chromium.launch({ headless: false, slowMo: 50 });
+
+  console.log("=> opening context")
   const context = await browser.newContext();
+
+  console.log("=> opening page")
   const page = await context.newPage();
 
-  const targetUsername = 'codex_401';
-  const profileUrl = `https://www.instagram.com/${targetUsername}/`;
+  console.log("=> going to instagram")
+  await page.goto("https://www.instagram.com/accounts/login/", { waitUntil: "networkidle" ,timeout:100000});
 
-  // Step 1: Open login page
-  console.log("🔐 Navigating to Instagram login page...");
-  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle' });
+  console.log("🔐 Log in manually, then press ENTER here.");
+  await ask("");
 
-  console.log('\n🚨 Please log in manually in the browser window.');
-  console.log('✅ Once logged in and you see your feed, press ENTER here to continue...\n');
-
-  // Step 2: Wait for Enter key
-  await new Promise<void>((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    rl.question('Press ENTER to continue after login...\n', () => {
-      rl.close();
-      resolve();
-    });
+  console.log("=> going to tag")
+  await page.goto(`https://www.instagram.com/explore/tags/${hashtag}/`, {
+    waitUntil: 'domcontentloaded',timeout:100000
   });
+  
+  
+  // Wait for at least one post to load
+  console.log("=> wait for loading")
+  await page.waitForSelector('a[href^="/p/"]',{timeout:50000});
 
-  console.log("✅ Continuing script after manual login...");
+  console.log("=> going for extract posts")
+  
+  const postSelector = 'a[href^="/p/"]';
 
-  // Step 3: Navigate to profile
-  console.log(`👤 Navigating to profile: ${targetUsername}`);
-  await page.goto(profileUrl, { waitUntil: 'load', timeout: 60000 });
 
-  // Step 4: Scroll to load posts
-  console.log("📜 Scrolling to load more posts...");
-  async function autoScroll(page: Page): Promise<void> {
-    let previousHeight = 0;
-    while (true) {
-      const currentHeight = await page.evaluate('document.body.scrollHeight');
-      if (currentHeight === previousHeight) break;
-      previousHeight = currentHeight as number;
-      await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
-      await page.waitForTimeout(2000);
+  const collectedUrls = new Set<string>();
+
+
+  let retries = 0;
+
+  console.log("=> start collecting urls")
+  
+  while (collectedUrls.size < 100 && retries < 10) {
+    
+    const newUrls = await page.$$eval(postSelector, anchors =>
+      anchors.map(a => (a as HTMLAnchorElement).href)
+    );
+    
+  
+    const previousSize = collectedUrls.size;
+    newUrls.forEach(url => collectedUrls.add(url));
+  
+    if (collectedUrls.size === previousSize) {
+      console.log("load filed retrying")
+      retries++;
+    } else {
+      console.log("loaded")
+      retries = 0;
     }
+  
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    console.log("scrolled start waiting")
+    await page.waitForTimeout(1500);
   }
 
-  await autoScroll(page);
-  console.log("✅ Scrolling complete.");
+  // Auto-scroll to load posts
+  // async function scrollAll(page: Page) {
+  //   let prev = 0;
+  //   while (true) {
+  //     const height = await page.evaluate(() => document.body.scrollHeight);
+  //     if (height === prev) break;
+  //     prev = height;
+  //     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  //     await page.waitForTimeout(2000);
+  //   }
+  // }
+  // await scrollAll(page);
 
-  // Step 5: Extract post URLs only
-  console.log("🔍 Searching for post links...");
-  await page.waitForSelector('a[href^="/p/"]');
+  // Extract post links
+  const postLinks = await page.$$eval('a[href^="/p/"]', (anchors) =>
+    Array.from(new Set(anchors.map((a) => (a as HTMLAnchorElement).href)))
+  );
 
-  const posts: { postUrl: string }[] = await page.evaluate(() => {
-    const postNodes = document.querySelectorAll('a[href^="/p/"]');
-    const data: { postUrl: string }[] = [];
+  const allComments: { username: string; comment: string; timestamp: string; postUrl: string }[] = [];
 
-    postNodes.forEach((node) => {
-      const href = node.getAttribute('href');
-      if (href) {
-        data.push({
-          postUrl: `https://www.instagram.com${href}`,
-        });
+  for (let i = 0; i < postLinks.length; i++) {
+    const postUrl = postLinks[i];
+    console.log(`\nPost ${i + 1}/${postLinks.length}: ${postUrl}`);
+    await page.goto(postUrl, { waitUntil: "load", timeout: 100000 });
+
+    // Wait for key
+    console.log("🟡 Press ENTER to extract, SPACE to skip, ESC to stop...");
+    const key = await waitForKey();
+
+    if (key === "esc") {
+      console.log("⛔ Stopped by user.");
+      break;
+    }
+
+    if (key === "space") {
+      console.log("⏭️ Skipped.");
+      continue;
+    }
+
+    // Expand comments
+    while (await page.$('button:has-text("View all comments")') || await page.$('button:has-text("Load more comments")')) {
+      try {
+        await page.click('button:has-text("View all comments"), button:has-text("Load more comments")');
+        await page.waitForTimeout(1500);
+      } catch {
+        break;
       }
-    });
+    }
 
-    return data;
-  });
+    
+    
+    const comments = await page.evaluate(() => {
+      const likeSelector = ".x1lliihq.x193iq5w.x6ikm8r.x10wlt62.xlyipyv.xuxw1ft";
+  
+      const commentSelector = ".x1lliihq.x1plvlek.xryxfnj.x1n2onr6.x1ji0vk5.x18bv5gf.x193iq5w.xeuugli.x1fj9vlw.x13faqbe.x1vvkbs.x1s928wv.xhkezso.x1gmr53x.x1cpjm7i.x1fgarty.x1943h6x.x1i0vuye.xvs91rp.xo1l8bm.x5n08af.x10wh9bi.x1wdrske.x8viiok.x18hxmgj";
 
-  // Step 6: Log post URLs
-  console.log(`\n✅ Extracted ${posts.length} post URLs:\n`);
-  posts.forEach((post, i) => {
-    console.log(`--- Post ${i + 1} ---`);
-    console.log(`Link: ${post.postUrl}\n`);
-  });
+      const data: { username: string; comment: string; timestamp: string }[] = [];
+      const commentSpans = document.querySelectorAll(commentSelector);
+      const likeSpans = document.querySelectorAll(likeSelector);
+      const time = document.querySelector("article time")?.getAttribute("datetime") || "";
 
-  // ======= NEW: Extract hashtagged messages and timestamps from each post =======
-
-  async function extractHashtagMessages(page: Page, postUrl: string) {
-    await page.goto(postUrl, { waitUntil: 'load', timeout: 60000 });
-
-    // Wait for post caption to load
-    await page.waitForSelector('article', { timeout: 15000 });
-
-    // Extract messages with hashtags and timestamps
-    const data = await page.evaluate(() => {
-      const results: { message: string; timestamp: string; hashtags: string[] }[] = [];
-
-      // Caption node selector
-      const captionNode = document.querySelector('article div > ul > li > div > div > span');
-      if (captionNode) {
-        const message = captionNode.textContent || '';
-        // Extract hashtags as lowercase without '#'
-        const hashtags = Array.from(message.matchAll(/#(\w+)/g)).map(m => m[1].toLowerCase());
-
-        // Timestamp inside time element under article
-        const timeNode = document.querySelector('article time');
-        const timestamp = timeNode ? timeNode.getAttribute('datetime') || '' : '';
-
-        if (hashtags.length > 0) {
-          results.push({ message, timestamp, hashtags });
+      commentSpans.forEach((node, i) => {
+        const comment = node.textContent || "";
+        const user = likeSpans[i]?.textContent || "";
+        if (comment && user) {
+          data.push({ username: user, comment, timestamp: time });
         }
-      }
-
-      return results;
-    });
-
-    return data;
-  }
-
-  // Collect all hashtagged messages
-  const allMessages: { message: string; timestamp: string; hashtag: string }[] = [];
-
-  for (const [index, post] of posts.entries()) {
-    console.log(`🔎 Extracting hashtag messages from post ${index + 1} / ${posts.length}`);
-    const extracted = await extractHashtagMessages(page, post.postUrl);
-
-    extracted.forEach(({ message, timestamp, hashtags }) => {
-      hashtags.forEach((hashtag) => {
-        allMessages.push({ message, timestamp, hashtag });
       });
-    });
-  }
 
-  // Save filtered messages to Excel
-  async function saveMessagesToExcel(data: { message: string; timestamp: string; hashtag: string }[]) {
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('HashtagMessages');
-
-    worksheet.columns = [
-      { header: 'Hashtag', key: 'hashtag', width: 20 },
-      { header: 'Timestamp', key: 'timestamp', width: 30 },
-      { header: 'Message', key: 'message', width: 100 },
-    ];
-
-    data.forEach((row) => {
-      worksheet.addRow(row);
+      return data;
     });
 
-    await workbook.xlsx.writeFile('hashtag_messages.xlsx');
-    console.log('✅ Hashtag messages saved to hashtag_messages.xlsx');
+    comments.map((c) => {
+        allComments.push({ ...c, postUrl });
+    });
+
+    console.log("✅ Comments extracted.",comments);
   }
 
-  await saveMessagesToExcel(allMessages);
+  // Save to Excel
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet("Instagram Comments");
+  worksheet.columns = [
+    { header: "Username", key: "username", width: 20 },
+    { header: "Comment", key: "comment", width: 80 },
+    { header: "Timestamp", key: "timestamp", width: 30 },
+    { header: "Post URL", key: "postUrl", width: 50 },
+  ];
+  allComments.forEach((row) => worksheet.addRow(row));
+  await workbook.xlsx.writeFile("instagram_comments.xlsx");
+  console.log("💾 Saved to instagram_comments.xlsx");
 
-  // ======= END NEW FEATURE =======
+  closeInput()
 
-  console.log("🛑 Closing browser.");
   await browser.close();
 })();
